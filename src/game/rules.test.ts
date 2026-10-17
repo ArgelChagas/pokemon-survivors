@@ -1,0 +1,105 @@
+import { describe, expect, it } from 'vitest'
+import { createRng } from '../engine/rng'
+import { createGrid, insert, query } from '../engine/spatial'
+import { effectiveness } from '../data/types'
+import { ITEMS } from '../data/items'
+import manifest from '../data/sprites.generated.json'
+import { REGIONS, STARTER_IDS, STARTERS, type StarterDef } from '../data/starters'
+import { maxMoveLevel, moveStats } from './moves'
+import { MAX_MOVES, offerPool, rollOffers, starterStats } from './leveling'
+import { BASE_STATS } from './stats'
+import type { OwnedMove } from './types'
+
+describe('effectiveness', () => {
+  it('softens the official chart', () => {
+    expect(effectiveness('water', ['rock', 'ground'])).toBe(2)
+    expect(effectiveness('fire', ['grass'])).toBe(1.5)
+    expect(effectiveness('fire', ['water'])).toBe(0.75)
+    expect(effectiveness('normal', ['ghost', 'poison'])).toBe(0.5)
+  })
+
+  it('covers the starters\' secondary types', () => {
+    expect(effectiveness('steel', ['rock', 'ground'])).toBe(1.5)
+    expect(effectiveness('dark', ['ghost', 'poison'])).toBe(1.5)
+    expect(effectiveness('fighting', ['ghost', 'poison'])).toBe(0.5)
+    expect(effectiveness('fairy', ['fighting'])).toBe(1.5)
+  })
+
+  it('lets Dragon resist the starter types and fall to Ice, Dragon and Fairy', () => {
+    for (const type of ['fire', 'water', 'grass', 'electric'] as const) expect(effectiveness(type, ['dragon'])).toBe(0.75)
+    expect(effectiveness('ice', ['dragon', 'ground'])).toBe(2)
+    expect(effectiveness('fairy', ['dragon'])).toBe(1.5)
+    expect(effectiveness('dragon', ['fairy'])).toBe(0.5)
+  })
+})
+
+describe('starter roster', () => {
+  it('lists every starter in exactly one region', () => {
+    const listed = REGIONS.flatMap((r) => r.starters)
+    expect(listed.toSorted()).toEqual(STARTER_IDS.toSorted())
+  })
+
+  it('starts each run with a move from a duplicate-free learnset', () => {
+    for (const id of STARTER_IDS) {
+      const s: StarterDef = STARTERS[id]
+      expect(s.learnset).toContain(s.signature)
+      expect(new Set(s.learnset).size).toBe(s.learnset.length)
+    }
+  })
+
+  it('has walk/idle/hurt sheets for every evolution stage', () => {
+    const sheets: Record<string, { anims: Record<string, unknown> }> = manifest
+    for (const id of STARTER_IDS)
+      for (const stage of STARTERS[id].line) expect(Object.keys(sheets[stage.dex]?.anims ?? {}).sort()).toEqual(['Hurt', 'Idle', 'Walk'])
+  })
+
+  it('only grows stronger when evolving', () => {
+    for (const id of STARTER_IDS) expect(starterStats(id, 2).maxHp).toBeGreaterThan(starterStats(id, 0).maxHp)
+  })
+})
+
+describe('level-up offers', () => {
+  it('never offers more than three distinct choices', () => {
+    const offers = rollOffers({ starter: 'charmander', moves: [{ id: 'ember', level: 1, cooldown: 0 }], items: [] }, createRng(1))
+    expect(offers).toHaveLength(3)
+    expect(new Set(offers.map((o) => JSON.stringify(o))).size).toBe(3)
+  })
+
+  it('only offers moves from the starter learnset', () => {
+    const pool = offerPool({ starter: 'squirtle', moves: [], items: [] })
+    const moves = pool.flatMap(([o]) => (o.kind === 'move' ? [o.id] : []))
+    expect(moves).toContain('whirlpool')
+    expect(moves).not.toContain('ember')
+  })
+
+  it('stops offering new moves when slots are full and falls back to a berry when maxed', () => {
+    const full: OwnedMove[] = (['ember', 'fireSpin', 'swift', 'thunder', 'sludgeBomb', 'gust'] as const).map((id) => ({
+      id,
+      level: maxMoveLevel(id),
+      cooldown: 0,
+    }))
+    expect(full).toHaveLength(MAX_MOVES)
+    const items = (Object.keys(ITEMS) as (keyof typeof ITEMS)[]).slice(0, 6).map((id) => ({ id, level: ITEMS[id].levels.length }))
+    expect(rollOffers({ starter: 'charmander', moves: full, items }, createRng(2))).toEqual([{ kind: 'berry' }])
+  })
+})
+
+describe('moveStats', () => {
+  it('stacks upgrades and player modifiers', () => {
+    const lv1 = moveStats('ember', 1, BASE_STATS)
+    const lv2 = moveStats('ember', 2, { ...BASE_STATS, might: 1.5, amount: 1 })
+    expect(lv1.amount).toBe(1)
+    expect(lv2.amount).toBe(3) // +1 upgrade, +1 player
+    expect(lv2.damage).toBeCloseTo(lv1.damage * 1.5)
+  })
+})
+
+describe('spatial grid', () => {
+  it('finds neighbours across cell borders', () => {
+    const grid = createGrid(32)
+    insert(grid, 0, 31, 31)
+    insert(grid, 1, 33, 33)
+    insert(grid, 2, 500, 500)
+    expect(query(grid, 32, 32, 8, []).sort()).toEqual([0, 1])
+  })
+})

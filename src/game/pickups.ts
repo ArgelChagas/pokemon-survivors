@@ -1,0 +1,155 @@
+import { dirTo, retain } from '../engine/math'
+import { range } from '../engine/rng'
+import { healPlayer } from './combat'
+import { burst, floatText } from './effects'
+import { useConsumable } from './consumables'
+import { rollEgg, type EggSource } from './eggs'
+import { applyOffer, gainXp, loadout, rollOffers } from './leveling'
+import { grantStone } from './mega'
+import type { Game, Pickup } from './types'
+import * as dm from '../engine/dmath'
+
+const MAX_XP_PICKUPS = 260
+/** Speed (px/s) a pulled pickup heads for the player at, well above any player's speed. */
+const PULL_SPEED = 720
+/** How fast (1/s) a pulled pickup's velocity turns toward the player. */
+const PULL_STEER = 16
+
+type PickupKind = Exclude<Pickup['kind'], 'xp' | 'coin' | 'consumable' | 'megaStone'>
+
+export const dropPickup = (g: Game, x: number, y: number, kind: PickupKind, autoCollect=false) => {
+  g.pickups.push({ id: g.nextId++, x, y, vx: 0, vy: 0, attracted: false, age: 0, kind, autoCollect })
+}
+
+/** Drops an Exp. Candy. Past the cap, value merges into the oldest candy so totals are never lost. */
+export const dropXp = (g: Game, x: number, y: number, value: number) => {
+  const xp = g.pickups.filter((p): p is Extract<Pickup, { kind: 'xp' }> => p.kind === 'xp')
+  const oldest = xp.length >= MAX_XP_PICKUPS ? xp.find((p) => !p.attracted) : undefined
+  if (oldest) {
+    oldest.value += value
+    return
+  }
+  g.pickups.push({ id: g.nextId++, x, y, vx: range(g.rng, -20, 20), vy: range(g.rng, -30, -10), attracted: false, age: 0, kind: 'xp', value })
+}
+
+/** Scatters Poké Dollar coins around a fainted enemy. */
+export const dropCoins = (g: Game, x: number, y: number, values: readonly number[]) => {
+  for (const value of values) {
+    const spread = values.length > 1 ? 40 : 15
+    g.pickups.push({ id: g.nextId++, x, y, vx: range(g.rng, -spread, spread), vy: range(g.rng, -spread, -5), attracted: false, age: 0, kind: 'coin', value })
+  }
+}
+
+/**
+ * Rolls an egg from `source` (`rollEgg`). A found egg goes straight into the
+ * run's bag, so it can't be lost on the ground when Mewtwo ends the run.
+ */
+export const awardEgg = (g: Game, source: EggSource, x: number, y: number) => {
+  const tier = rollEgg(g.rng, source, g.eggs)
+  if (!tier) return
+  g.eggs.found.push({ tier, at: g.player.walked })
+  g.eggs.lucky = false
+  burst(g, x, y - 12, { colors: ['#f8f0d0', '#ffffff', '#58c858', '#f8d030'], count: 36, speed: 110, ttl: 0.8, gravity: 40 })
+  g.events.push({ kind: 'egg', tier })
+}
+
+/** Exp. Candy size tier, used for rendering. */
+export const xpTier = (value: number) => (value >= 40 ? 3 : value >= 10 ? 2 : value >= 3 ? 1 : 0)
+
+const collect = (g: Game, pickup: Pickup) => {
+  const p = g.player
+  switch (pickup.kind) {
+    case 'xp':
+      gainXp(g, pickup.value)
+      g.events.push({ kind: 'pickup' })
+      break
+    case 'coin': {
+      const amount = Math.round(pickup.value * p.stats.greed)
+      g.coins += amount
+      floatText(g, p.x, p.y - 30, `₽${amount}`, '#f8d030')
+      g.events.push({ kind: 'coin' })
+      break
+    }
+    case 'berry': {
+      const heal = Math.round(healPlayer(g, p.stats.maxHp * 0.3))
+      floatText(g, p.x, p.y - 30, `+${heal}`, '#58e858')
+      burst(g, p.x, p.y - 10, { colors: ['#58e858', '#c8f8c8'], count: 12, speed: 60, ttl: 0.5, gravity: -40 })
+      g.events.push({ kind: 'heal' })
+      break
+    }
+    case 'pokeball': {
+      const [offer] = rollOffers(loadout(g), g.rng, 1)
+      if (offer) applyOffer(g, offer)
+      burst(g, p.x, p.y - 10, { colors: ['#f83838', '#ffffff', '#ffd830'], count: 30, speed: 120, ttl: 0.6 })
+      // Evolutions celebrate with their own event instead of the Poké Ball toast.
+      if (offer?.kind !== 'evolution') g.events.push({ kind: 'pokeball', offer: offer ?? null })
+      break
+    }
+    case 'megaStone':
+      grantStone(g, pickup.mega)
+      break
+    case 'consumable':
+      useConsumable(g, pickup.item)
+      break
+  }
+}
+
+/** Mega Stones on the ground: two or more means the player is choosing one, so the magnet leaves them be. */
+const megaStones = (g: Game) => {
+  let n = 0
+  for (const k of g.pickups) if (k.kind === 'megaStone') n++
+  return n
+}
+
+export const updatePickups = (g: Game, dt: number) => {
+  const p = g.player
+  const magnet2 = dm.sq(p.stats.magnet)
+  const choosing = megaStones(g) > 1
+  for (const k of g.pickups) {
+    k.age += dt
+    const d2 = dm.sq(k.x - p.x) + dm.sq(k.y - (p.y - 6))
+    if (choosing && k.kind === 'megaStone') {
+      if (d2 < dm.sq(p.radius + 8)) {
+        collect(g, k)
+        k.age = -1
+      }
+      continue
+    }
+    const returning=k.kind==='pokeball' || k.autoCollect===true
+    // Reward balls always return, including drops outside the camera or behind terrain.
+    // Victory stops the simulation, so settle that last reward in the winning tick.
+    if(returning && (k.age>=2 || g.phase==='victory')) {collect(g,k);k.age=-1;continue}
+    const reach = p.radius + (k.kind==='pokeball' ? 30 : 21)
+    if(d2 <= dm.sq(reach)) {collect(g,k);k.age=-1;continue}
+    const range2 = k.kind==='consumable' || k.kind==='berry' ? Math.max(magnet2,dm.sq(190)) : k.kind==='megaStone' ? Math.max(magnet2,dm.sq(145)) : magnet2
+    if (!k.attracted && (d2 < range2 || returning && k.age>=0.2)) {
+      k.attracted = true
+      // Start toward the partner immediately.
+      const d = dirTo(p.x, p.y, k.x, k.y)
+      k.vx = -d.x * 80
+      k.vy = -d.y * 80
+    }
+    if (k.attracted) {
+      // Steer the velocity toward the player rather than adding a pull to it: a
+      // pull keeps the sideways speed, and a candy could orbit the player forever.
+      const d = dirTo(k.x, k.y, p.x, p.y - 6)
+      const speed=returning ? Math.max(1100,dm.hypot(p.vx,p.vy)+500) : PULL_SPEED
+      const steer = 1 - dm.exp(-PULL_STEER * dt)
+      k.vx += (d.x * speed - k.vx) * steer
+      k.vy += (d.y * speed - k.vy) * steer
+    } else {
+      k.vx *= dm.exp(-6 * dt)
+      k.vy *= dm.exp(-6 * dt)
+    }
+    k.x += k.vx * dt
+    k.y += k.vy * dt
+    // Checked after the move and with this frame's step as slack, so a fast candy can't hop over the player.
+    const collectReach = p.radius + 17 + dm.hypot(k.vx, k.vy) * dt
+    if (k.attracted && dm.sq(k.x - p.x) + dm.sq(k.y - (p.y - 6)) < dm.sq(collectReach)) {
+      collect(g, k)
+      k.age = -1
+    }
+  }
+  retain(g.pickups, (k) => k.age >= 0)
+}
+

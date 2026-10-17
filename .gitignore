@@ -1,0 +1,16 @@
+node_modules
+dist
+.DS_Store
+.env
+.env.*.local
+.env.local
+
+# Local experiments, caches and private configuration
+work/
+coverage/
+*.log
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
